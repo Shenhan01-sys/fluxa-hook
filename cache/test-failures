@@ -1,1 +1,1 @@
-test_modeB_exactOutput_falls_back_to_modeA|test_modeB_large_input_no_overflow
+test_modeC_happy_path_full_settlement|test_modeC_no_valid_bids_reverts

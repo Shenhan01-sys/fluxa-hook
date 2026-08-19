@@ -46,7 +46,7 @@ interface IFluxaHook {
     event RemoveLiquidity(PoolId indexed poolId, address indexed sender, uint256 amount0, uint256 amount1, uint256 shares);
     event BidCommitted(PoolId indexed poolId, address indexed bidder);
     event BidRevealed(PoolId indexed poolId, address indexed bidder, uint256 amount);
-    event AuctionSettled(PoolId indexed poolId, address winner, uint256 amount);
+    event AuctionSettled(PoolId indexed poolId, address winner, uint256 amount, uint256 fee, uint256 netToLPs);
     event ModeBSwap(PoolId indexed poolId, uint256 aiPrice, uint256 grossOutput, uint256 feeAmount);
 
     error InvalidState(PoolId poolId, PoolState current, PoolState expected);
@@ -62,7 +62,7 @@ interface IFluxaHook {
     error InstrumentNotRegistered(PoolId poolId);
     error OnlyOwner();
 
-    function registerInstrument(PoolId poolId, RWAInstrument calldata instrument) external;
+    function registerInstrument(PoolId poolId, RWAInstrument calldata instrument, PoolKey calldata key) external;
     function setDistress(PoolId poolId, PoolState newState) external;
     function addLiquidity(PoolKey calldata key, uint256 amount0, uint256 amount1, address sender) external returns (uint256 shares);
     function removeLiquidity(PoolKey calldata key, uint256 shares) external returns (uint256 amount0, uint256 amount1);

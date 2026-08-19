@@ -40,6 +40,7 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
     uint256 public constant STALENESS_GUARD       = 1 hours;
     uint256 public constant AUCTION_COMMIT_WINDOW = 1 hours;
     uint256 public constant AUCTION_REVEAL_WINDOW = 30 minutes;
+    uint256 public constant MODE_C_FEE_BPS        = 200; // 2% auction fee
     uint24  private constant OVERRIDE_FEE_FLAG    = 0x400000;
 
     IChronicleOracle public immutable chronicle;
@@ -58,6 +59,8 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
     mapping(PoolId => FluxaLPShares) public lpShares;
     mapping(PoolId => uint256) public totalLiquidity0;
     mapping(PoolId => uint256) public totalLiquidity1;
+
+    mapping(PoolId => PoolKey) private _poolKeys;
 
     bytes private _callbackDataCache;
 
@@ -123,8 +126,9 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         return _auctions[id];
     }
 
-    function registerInstrument(PoolId poolId, RWAInstrument calldata instrument) external onlyOwner {
+    function registerInstrument(PoolId poolId, RWAInstrument calldata instrument, PoolKey calldata key) external onlyOwner {
         _instruments[poolId] = instrument;
+        _poolKeys[poolId] = key;
         _instrumentRegistered[poolId] = true;
         _poolState[poolId] = PoolState.Normal;
         if (address(lpShares[poolId]) == address(0)) {
@@ -226,6 +230,8 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
             return _handleAddLiquidity();
         } else if (k == 2) {
             return _handleRemoveLiquidity();
+        } else if (k == 3) {
+            return _handleModeCSettlement();
         }
         revert("FluxaHook: unknown callback kind");
     }
@@ -264,6 +270,34 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         c1.take(poolManager, data.recipient, data.amount1, false);
 
         return "";
+    }
+
+    function _handleModeCSettlement() internal returns (bytes memory) {
+        SettlementCallbackData memory data = abi.decode(_callbackDataCache, (SettlementCallbackData));
+
+        Currency c0 = data.poolKey.currency0;
+        Currency c1 = data.poolKey.currency1;
+
+        // Step 1: Transfer winner's USDC (token1) from hook to PM, mint USDC claim to hook
+        IERC20(Currency.unwrap(c1)).approve(address(poolManager), data.bidAmount);
+        c1.settle(poolManager, address(this), data.bidAmount, false);
+        c1.take(poolManager, address(this), data.bidAmount, true);
+
+        // Step 2: Transfer hook's RWA claims (token0) to winner via PM (ERC6909)
+        uint256 rwaClaimId = c0.toId();
+        uint256 rwaBalance = poolManager.balanceOf(address(this), rwaClaimId);
+        if (rwaBalance > 0) {
+            poolManager.approve(address(this), rwaClaimId, rwaBalance);
+            poolManager.transferFrom(address(this), data.winner, rwaClaimId, rwaBalance);
+        }
+
+        return "";
+    }
+
+    struct SettlementCallbackData {
+        PoolKey poolKey;
+        address winner;
+        uint256 bidAmount;
     }
 
     function removeLiquidity(
@@ -474,12 +508,41 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         if (!auc.active) revert AuctionNotActive(poolId);
         if (block.timestamp <= auc.revealDeadline) revert("RevealPhase");
         if (auc.highestBidder == address(0)) revert NoValidBids(poolId);
+
         address winner = auc.highestBidder;
         uint256 amount = auc.highestAmount;
-        delete _auctions[poolId];
+
+        // Calculate auction fee (2% MODE_C_FEE_BPS) — goes to LP appreciation
+        uint256 fee = (amount * MODE_C_FEE_BPS) / 10000;
+
+        // Pull USDC from winner via transferFrom (winner must approve before bidding)
+        PoolKey storage key = _poolKeys[poolId];
+        Currency c1 = key.currency1; // USDC
+        address token1Addr = Currency.unwrap(c1);
+        IERC20(token1Addr).safeTransferFrom(winner, address(this), amount);
+
+        // State: Distress -> Resolution (auction in progress)
         _setDistress(poolId, PoolState.Resolution);
-        emit AuctionSettled(poolId, winner, amount);
+
+        // Set callback data for Mode C PM operations
+        _callbackDataCache = abi.encode(SettlementCallbackData({
+            poolKey: key,
+            winner: winner,
+            bidAmount: amount
+        }));
+        poolManager.unlock(abi.encode(uint8(3)));
+
+        // Fee accounting: cumulativeYield++ (LP shares appreciates automatically)
+        cumulativeYield[poolId] += fee;
+
+        // Emit settlement details (winner, amount, fee, net-to-LPs)
+        emit AuctionSettled(poolId, winner, amount, fee, amount - fee);
+
+        // State: Resolution -> Normal (pool reopens)
         _setDistress(poolId, PoolState.Normal);
+
+        // Cleanup auction storage
+        delete _auctions[poolId];
     }
 
     function _setDistress(PoolId poolId, PoolState newState) internal {

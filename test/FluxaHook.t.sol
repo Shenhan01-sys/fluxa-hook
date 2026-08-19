@@ -13,6 +13,7 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {IERC20Minimal} from "@uniswap/v4-core/src/interfaces/external/IERC20Minimal.sol";
+import {IERC6909Claims} from "@uniswap/v4-core/src/interfaces/external/IERC6909Claims.sol";
 
 import {FluxaHook} from "../src/FluxaHook.sol";
 import {FluxaLPShares} from "../src/FluxaLPShares.sol";
@@ -95,7 +96,7 @@ contract FluxaHookTest is Test, Deployers {
             illiquid: false,
             maturityTs: block.timestamp + 365 days
         });
-        hook.registerInstrument(poolId, inst);
+        hook.registerInstrument(poolId, inst, key);
 
         manager.initialize(key, 79228162514264337593543950336);
     }
@@ -234,11 +235,20 @@ contract FluxaHookTest is Test, Deployers {
     }
 
     function test_auction_commit_reveal_settle() public {
-        _registerInstrument();
+        _addInitialLiquidity();  // hook now holds RWA claims (currency0) + USDC claims (currency1)
+
+        // Trigger distress (oracle reports default)
+        chronicleOracle.setDefaulted(address(rwaToken), true);
         hook.setDistress(poolId, IFluxaHook.PoolState.Distress);
         assertEq(uint256(hook.viewPoolState(poolId)), uint256(IFluxaHook.PoolState.Distress));
 
+        // Fund winner with USDC (currency1) and approve hook
         uint256 amount = 1 ether;
+        IERC20Minimal(Currency.unwrap(currency1)).transfer(bidderUser, amount);
+        vm.prank(bidderUser);
+        IERC20Minimal(Currency.unwrap(currency1)).approve(address(hook), amount);
+
+        // Commit + reveal + settle
         bytes32 nonce = keccak256("bid1");
         bytes32 commitHash = keccak256(abi.encodePacked(amount, nonce));
 
@@ -252,7 +262,15 @@ contract FluxaHookTest is Test, Deployers {
 
         vm.warp(block.timestamp + 30 minutes + 1 seconds);
 
+        // Check winner receives RWA claims (currency0)
+        uint256 rwaClaimId = currency0.toId();
+        uint256 winnerRWABefore = IERC6909Claims(address(manager)).balanceOf(bidderUser, rwaClaimId);
+        uint256 hookRWA = IERC6909Claims(address(manager)).balanceOf(address(hook), rwaClaimId);
+
         hook.settleAuction(poolId);
+
+        uint256 winnerRWAAfter = IERC6909Claims(address(manager)).balanceOf(bidderUser, rwaClaimId);
+        assertEq(winnerRWAAfter - winnerRWABefore, hookRWA, "winner got all RWA claims");
         assertEq(uint256(hook.viewPoolState(poolId)), uint256(IFluxaHook.PoolState.Normal));
     }
 

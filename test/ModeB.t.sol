@@ -97,7 +97,7 @@ contract ModeBTests is Test, Deployers {
             illiquid: true,
             maturityTs: block.timestamp + 365 days
         });
-        hook.registerInstrument(poolId, inst);
+        hook.registerInstrument(poolId, inst, key);
         manager.initialize(key, 79228162514264337593543950336);
     }
 
