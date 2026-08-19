@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {console} from "forge-std/console.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
+import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+
+import {FluxaHook} from "../src/FluxaHook.sol";
+import {BaseHook} from "../src/vendor/BaseHook.sol";
+import {IFluxaHook} from "../src/interfaces/IFluxaHook.sol";
+import {MockChronicleOracle} from "../src/mocks/MockChronicleOracle.sol";
+import {MockERC8004, MockERC7857} from "../src/mocks/MockERC8004.sol";
+import {MockRWAInstrument} from "../src/mocks/MockRWAInstrument.sol";
+
+contract FluxaHookTest is Test, Deployers {
+    using PoolIdLibrary for PoolKey;
+
+    FluxaHook public hook;
+    MockChronicleOracle public chronicleOracle;
+    MockERC8004 public reputationRegistry;
+    MockERC7857 public agentNft;
+    MockRWAInstrument public rwaToken;
+    PoolId public poolId;
+
+    address public agentUser = makeAddr("agentUser");
+    address public bidderUser = makeAddr("bidderUser");
+
+    function setUp() public {
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        chronicleOracle = new MockChronicleOracle();
+        reputationRegistry = new MockERC8004();
+        agentNft = new MockERC7857();
+        rwaToken = new MockRWAInstrument("Goldfinch FIDU", "FIDU", 18);
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG |
+            Hooks.BEFORE_ADD_LIQUIDITY_FLAG |
+            Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG |
+            Hooks.BEFORE_SWAP_FLAG |
+            Hooks.AFTER_SWAP_FLAG |
+            Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+        );
+
+        (address hookAddr, bytes32 salt) = HookMiner.find(
+            address(this),
+            flags,
+            type(FluxaHook).creationCode,
+            abi.encode(manager, address(chronicleOracle), address(reputationRegistry), address(agentNft), address(this))
+        );
+
+        hook = new FluxaHook{salt: salt}(
+            manager,
+            chronicleOracle,
+            reputationRegistry,
+            agentNft,
+            address(this)
+        );
+        require(address(hook) == hookAddr, "HookMiner: address mismatch");
+    }
+
+    function _registerInstrument() internal {
+        rwaToken.mint(address(this), 100 ether);
+        chronicleOracle.setPrice(address(rwaToken), 1e18);
+        chronicleOracle.setYield(address(rwaToken), 1000);
+
+        IFluxaHook.RWAInstrument memory inst = IFluxaHook.RWAInstrument({
+            token: address(rwaToken),
+            riskTier: 1,
+            oracle: address(chronicleOracle),
+            illiquid: false,
+            maturityTs: block.timestamp + 365 days
+        });
+
+        key = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: hook
+        });
+        poolId = key.toId();
+
+        hook.registerInstrument(poolId, inst);
+
+        (key, poolId) = initPool(
+            currency0, currency1, hook, 3000, 79228162514264337593543950336
+        );
+    }
+
+    function test_deployment_permissions() public view {
+        BaseHook.HooksPermissions memory perms = hook.getHookPermissions();
+        assertFalse(perms.beforeInitialize);
+        assertTrue(perms.afterInitialize);
+        assertTrue(perms.beforeAddLiquidity);
+        assertTrue(perms.beforeRemoveLiquidity);
+        assertTrue(perms.beforeSwap);
+        assertTrue(perms.afterSwap);
+        assertTrue(perms.beforeSwapReturnDelta);
+        assertFalse(perms.afterSwapReturnDelta);
+    }
+
+    function test_register_instrument() public {
+        _registerInstrument();
+        IFluxaHook.RWAInstrument memory stored = hook.viewInstrument(poolId);
+        assertEq(stored.token, address(rwaToken));
+        assertEq(stored.riskTier, 1);
+        assertFalse(stored.illiquid);
+        assertEq(uint256(hook.viewPoolState(poolId)), uint256(IFluxaHook.PoolState.Normal));
+    }
+
+    function test_reputation_gate_pass_with_agent() public {
+        _registerInstrument();
+
+        uint256 agentId = agentNft.mint(agentUser);
+        reputationRegistry.setReputation(agentId, 90);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -120, tickUpper: 120, liquidityDelta: 1 ether, salt: bytes32(0)}),
+            abi.encode(agentId)
+        );
+        assertEq(hook.poolAgent(poolId), agentUser);
+    }
+
+    function test_reputation_gate_blocks_low_score() public {
+        _registerInstrument();
+
+        uint256 badAgentId = agentNft.mint(agentUser);
+        reputationRegistry.setReputation(badAgentId, 30);
+
+        vm.expectRevert();
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -120, tickUpper: 120, liquidityDelta: 1 ether, salt: bytes32(0)}),
+            abi.encode(badAgentId)
+        );
+    }
+
+    function test_auction_commit_reveal_settle() public {
+        _registerInstrument();
+        hook.setDistress(poolId, IFluxaHook.PoolState.Distress);
+        assertEq(uint256(hook.viewPoolState(poolId)), uint256(IFluxaHook.PoolState.Distress));
+
+        uint256 amount = 1 ether;
+        bytes32 nonce = keccak256("bid1");
+        bytes32 commitHash = keccak256(abi.encodePacked(amount, nonce));
+
+        vm.prank(bidderUser);
+        hook.commitBid(poolId, commitHash);
+
+        vm.warp(block.timestamp + 1 hours + 1 seconds);
+
+        vm.prank(bidderUser);
+        hook.revealBid(poolId, amount, nonce);
+
+        vm.warp(block.timestamp + 30 minutes + 1 seconds);
+
+        hook.settleAuction(poolId);
+        assertEq(uint256(hook.viewPoolState(poolId)), uint256(IFluxaHook.PoolState.Normal));
+    }
+
+    function test_oracle_staleness_blocks_swap() public {
+        _registerInstrument();
+
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 10 ether, salt: bytes32(0)}),
+            ""
+        );
+
+        chronicleOracle.setPrice(address(rwaToken), 1e18);
+        vm.warp(block.timestamp + 2 hours);
+
+        vm.expectRevert();
+        swap(key, true, -1e18, "");
+    }
+}
