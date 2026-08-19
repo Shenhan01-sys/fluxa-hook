@@ -158,14 +158,14 @@ contract ModeBTests is Test, Deployers {
         bytes memory proof = abi.encode(bytes32("unknown"));
         bytes memory hookData = _buildModeBHookData(proof);
 
-        // Mode A pricing at oracle price 1.0 with BASE_FEE (0.3% = 3000/1e6)
+        // Mode A pricing at oracle price 1.0 with dynamic fee (0.4% = 4000/1e6 for riskTier=1)
         uint256 amountIn = 10 ether;
         uint256 balanceBefore1 = currency1.balanceOfSelf();
         swap(key, true, -int256(amountIn), hookData);
         uint256 balanceAfter1 = currency1.balanceOfSelf();
 
         // Mode A output: amount - 0.3% fee at price 1.0
-        uint256 expectedFee = (amountIn * 3000) / 1_000_000;
+        uint256 expectedFee = (amountIn * 4000) / 1_000_000;
         uint256 expectedNet = amountIn - expectedFee;
         assertEq(balanceAfter1 - balanceBefore1, expectedNet, "Mode A fallback pricing");
     }
@@ -178,7 +178,7 @@ contract ModeBTests is Test, Deployers {
         swap(key, true, -int256(amountIn), hookData);
         uint256 balanceAfter1 = currency1.balanceOfSelf();
 
-        uint256 expectedFee = (amountIn * 3000) / 1_000_000;
+        uint256 expectedFee = (amountIn * 4000) / 1_000_000;
         uint256 expectedNet = amountIn - expectedFee;
         assertEq(balanceAfter1 - balanceBefore1, expectedNet, "Mode A fallback for empty hookData");
     }

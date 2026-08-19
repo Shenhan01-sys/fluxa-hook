@@ -24,6 +24,25 @@ interface IFluxaHook {
         uint256 commitDeadline;
     }
 
+    struct PoolMetadata {
+        address currency0;
+        address currency1;
+        uint24  fee;
+        int24   tickSpacing;
+        PoolState state;
+        address rwaToken;
+        uint8   riskTier;
+        bool    illiquid;
+        uint256 maturityTs;
+        uint256 totalLiquidity0;
+        uint256 totalLiquidity1;
+        uint256 cumulativeYield;
+        uint256 baseFee;
+        address agent;
+        uint256 lastAttestedPrice;
+        uint256 lastAttestationTimestamp;
+    }
+
     event HookSwap(
         address indexed poolManager,
         PoolId indexed poolId,
@@ -69,4 +88,8 @@ interface IFluxaHook {
     function commitBid(PoolId poolId, bytes32 commitHash) external;
     function revealBid(PoolId poolId, uint256 amount, bytes32 nonce) external;
     function settleAuction(PoolId poolId) external;
+
+    // Tao self-integration: deterministic quote + metadata views
+    function quote(PoolId poolId, uint256 inputAmount, bool zeroForOne) external view returns (uint256 outputAmount, uint256 feeAmount);
+    function getPoolMetadata(PoolId poolId) external view returns (PoolMetadata memory);
 }

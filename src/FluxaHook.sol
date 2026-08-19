@@ -62,6 +62,10 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
 
     mapping(PoolId => PoolKey) private _poolKeys;
 
+    // Cache last attested price for Mode B quote function (Tao self-integration)
+    mapping(PoolId => uint256) public lastAttestedPrice;
+    mapping(PoolId => uint256) public lastAttestationTimestamp;
+
     bytes private _callbackDataCache;
 
     constructor(
@@ -395,6 +399,10 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
             params, key, aiPrice, poolManager
         );
 
+        // Cache attested price for deterministic quote function (Tao self-integration)
+        lastAttestedPrice[id] = aiPrice;
+        lastAttestationTimestamp[id] = block.timestamp;
+
         // Track yield + emit Mode B event
         cumulativeYield[id] += result.feeAmount;
         emit ModeBSwap(id, aiPrice, result.grossOutput, result.feeAmount);
@@ -416,7 +424,10 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
             ? uint256(params.amountSpecified)
             : uint256(-params.amountSpecified);
 
-        uint256 fee = (amountInOutPositive * BASE_FEE) / 1_000_000;
+        // Dynamic fee: BASE_FEE + riskTier * 10bps (per PRD §5 Mode A)
+        // riskTier 1 = 0.4%, riskTier 2 = 0.5%, riskTier 3 = 0.6% (max 1,000,000 cap)
+        uint256 dynamicFee = BASE_FEE + (inst.riskTier * 1000);
+        uint256 fee = (amountInOutPositive * dynamicFee) / 1_000_000;
         uint256 netAmount = amountInOutPositive - fee;
 
         int128 deltaSpecified = int128(-params.amountSpecified);
@@ -571,6 +582,107 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         assembly { dataLen := calldataload(add(hookData.offset, dataOffset)) }
         uint256 dataStart = dataOffset + 32;
         proof = hookData[dataStart : dataStart + dataLen];
+    }
+
+    // ==========================================================================
+    //  TAO SELF-INTEGRATION: deterministic quote + metadata
+    //  Tao (Rust library, ~20% CoW Swap mainnet + ~40% CoW Base flow) calls
+    //  these view functions via substreams indexing to discover + price liquidity.
+    //  Reference: Incubator-Maps/T08 - How to Win Orderflow
+    // ==========================================================================
+
+    /// @notice Deterministic quote for Tao router/solver integration
+    /// @dev View function, deterministic (no timestamp dependence in pure computation path)
+    /// Mode A: uses Chronicle oracle price (last known, view-call is deterministic)
+    /// Mode B (illiquid): uses cached lastAttestedPrice (updated on each successful swap)
+    /// Mode C (distress): reverts (auction in progress, prices undefined)
+    /// @param poolId The pool to quote
+    /// @param inputAmount Absolute input amount (uint256, positive)
+    /// @param zeroForOne Direction: true sells token0 (RWA) for token1 (USDC), false opposite
+    /// @return outputAmount Amount of output token after fee (uint256)
+    /// @return feeAmount Amount of fee deducted (uint256)
+    function quote(
+        PoolId poolId,
+        uint256 inputAmount,
+        bool zeroForOne
+    ) external view returns (uint256 outputAmount, uint256 feeAmount) {
+        if (!_instrumentRegistered[poolId]) revert InstrumentNotRegistered(poolId);
+        if (_poolState[poolId] == PoolState.Distress) {
+            revert InvalidState(poolId, _poolState[poolId], PoolState.Normal);
+        }
+        RWAInstrument storage inst = _instruments[poolId];
+
+        uint256 price;
+        if (!inst.illiquid) {
+            // Mode A: Chronicle oracle with staleness guard (matches _modeASwap behavior)
+            uint256 updateTs;
+            (price, updateTs) = chronicle.readPrice(inst.token);
+            if (price == 0 || block.timestamp - updateTs >= STALENESS_GUARD) {
+                revert OracleStale(poolId);
+            }
+
+            // Dynamic fee: BASE_FEE + riskTier * 10bps
+            uint24 fee = uint24(BASE_FEE + (inst.riskTier * 1000));
+            feeAmount = (inputAmount * uint256(fee)) / 1_000_000;
+        } else {
+            // Mode B: cached attested price (updated in _modeBSwap)
+            price = lastAttestedPrice[poolId];
+            if (price == 0) revert OracleStale(poolId);
+
+            // Mode B fee: 5% on gross output (matches AgentPricing.computeSwap)
+            // Computed below after grossOutput is known.
+        }
+
+        uint256 grossOutput;
+        if (zeroForOne) {
+            // token0 (RWA) -> token1 (USDC): output = input * price
+            grossOutput = Math.mulDiv(inputAmount, price, 1e18);
+        } else {
+            // token1 (USDC) -> token0 (RWA): output = input / price
+            grossOutput = Math.mulDiv(inputAmount, 1e18, price);
+        }
+
+        // Compute fee AFTER grossOutput is known
+        if (inst.illiquid) {
+            feeAmount = (grossOutput * 500) / 10000;
+        }
+
+        outputAmount = grossOutput - feeAmount;
+    }
+
+    /// @notice Pool metadata view for Tao indexer (pool discovery)
+    /// @dev Used by Tao indexer (substreams package) to catalog pools
+    function getPoolMetadata(PoolId poolId) external view returns (IFluxaHook.PoolMetadata memory) {
+        if (!_instrumentRegistered[poolId]) revert InstrumentNotRegistered(poolId);
+
+        RWAInstrument storage inst = _instruments[poolId];
+        PoolKey storage key = _poolKeys[poolId];
+
+        uint24 fee;
+        if (!inst.illiquid) {
+            fee = uint24(BASE_FEE + (inst.riskTier * 1000));
+        } else {
+            fee = 500; // MODE_B_FEE_BPS (uint24)
+        }
+
+        return IFluxaHook.PoolMetadata({
+            currency0: Currency.unwrap(key.currency0),
+            currency1: Currency.unwrap(key.currency1),
+            fee: fee,
+            tickSpacing: key.tickSpacing,
+            state: _poolState[poolId],
+            rwaToken: inst.token,
+            riskTier: inst.riskTier,
+            illiquid: inst.illiquid,
+            maturityTs: inst.maturityTs,
+            totalLiquidity0: totalLiquidity0[poolId],
+            totalLiquidity1: totalLiquidity1[poolId],
+            cumulativeYield: cumulativeYield[poolId],
+            baseFee: uint256(fee),
+            agent: poolAgent[poolId],
+            lastAttestedPrice: lastAttestedPrice[poolId],
+            lastAttestationTimestamp: lastAttestationTimestamp[poolId]
+        });
     }
 
     receive() external payable {}

@@ -197,7 +197,8 @@ contract FluxaHookTest is Test, Deployers {
         uint256 balanceOfTokenBAfter = currency1.balanceOfSelf();
         uint256 balanceOfTokenAAfter = currency0.balanceOfSelf();
 
-        uint256 expectedOut = 10 ether - (10 ether * 3000 / 1_000_000);
+        // Dynamic fee: BASE_FEE (3000) + riskTier (1) * 1000 = 4000 (0.4%)
+        uint256 expectedOut = 10 ether - (10 ether * 4000 / 1_000_000);
         assertEq(balanceOfTokenBAfter - balanceOfTokenBBefore, expectedOut, "output");
         assertEq(balanceOfTokenABefore - balanceOfTokenAAfter, 10 ether, "input");
     }
@@ -296,7 +297,8 @@ contract FluxaHookTest is Test, Deployers {
         swap(key, true, -10 ether, "");
 
         uint256 yield0 = hook.cumulativeYield(poolId);
-        uint256 expectedYield = (10 ether * 3000) / 1_000_000;
+        // Dynamic fee: BASE_FEE (3000) + riskTier (1) * 1000 = 4000 (0.4%)
+        uint256 expectedYield = (10 ether * 4000) / 1_000_000;
         assertEq(yield0, expectedYield, "yield tracks fees");
     }
 
