@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
 interface IFluxaHook {
@@ -41,6 +42,8 @@ interface IFluxaHook {
 
     event InstrumentRegistered(PoolId indexed poolId, address token, uint8 riskTier, bool illiquid, uint256 maturityTs);
     event PoolStateChanged(PoolId indexed poolId, PoolState oldState, PoolState newState);
+    event AddLiquidity(PoolId indexed poolId, address indexed sender, uint256 amount0, uint256 amount1, uint256 shares);
+    event RemoveLiquidity(PoolId indexed poolId, address indexed sender, uint256 amount0, uint256 amount1, uint256 shares);
     event BidCommitted(PoolId indexed poolId, address indexed bidder);
     event BidRevealed(PoolId indexed poolId, address indexed bidder, uint256 amount);
     event AuctionSettled(PoolId indexed poolId, address winner, uint256 amount);
@@ -60,6 +63,8 @@ interface IFluxaHook {
 
     function registerInstrument(PoolId poolId, RWAInstrument calldata instrument) external;
     function setDistress(PoolId poolId, PoolState newState) external;
+    function addLiquidity(PoolKey calldata key, uint256 amount0, uint256 amount1, address sender) external returns (uint256 shares);
+    function removeLiquidity(PoolKey calldata key, uint256 shares) external returns (uint256 amount0, uint256 amount1);
     function commitBid(PoolId poolId, bytes32 commitHash) external;
     function revealBid(PoolId poolId, uint256 amount, bytes32 nonce) external;
     function settleAuction(PoolId poolId) external;
