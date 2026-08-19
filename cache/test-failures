@@ -1,1 +1,1 @@
-test_removeLiquidity|test_swap_exactInput_zeroForOne|test_yield_accumulates
+test_modeB_exactOutput_falls_back_to_modeA|test_modeB_large_input_no_overflow

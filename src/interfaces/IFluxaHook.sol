@@ -47,6 +47,7 @@ interface IFluxaHook {
     event BidCommitted(PoolId indexed poolId, address indexed bidder);
     event BidRevealed(PoolId indexed poolId, address indexed bidder, uint256 amount);
     event AuctionSettled(PoolId indexed poolId, address winner, uint256 amount);
+    event ModeBSwap(PoolId indexed poolId, uint256 aiPrice, uint256 grossOutput, uint256 feeAmount);
 
     error InvalidState(PoolId poolId, PoolState current, PoolState expected);
     error AuctionNotActive(PoolId poolId);

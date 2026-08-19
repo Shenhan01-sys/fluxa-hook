@@ -6,6 +6,7 @@ import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockC
 import {BaseHook} from "./vendor/BaseHook.sol";
 import {IFluxaHook} from "./interfaces/IFluxaHook.sol";
 import {FluxaLPShares} from "./FluxaLPShares.sol";
+import {AgentPricing} from "./libraries/AgentPricing.sol";
 
 import {IChronicleOracle} from "./interfaces/IChronicleOracle.sol";
 import {IERC8004Registry, IERC7857Agent} from "./interfaces/IERC8004Registry.sol";
@@ -327,26 +328,44 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
             return _modeASwap(key, params);
         }
 
-        if (hookData.length >= 64) {
-            (bytes calldata proof, int128 hookDeltaSpecified) = _extractModeBData(hookData);
-            (bool valid, uint256 aiPrice) = chronicle.verifyAttestation(proof);
-            if (valid && aiPrice > 0) {
-                int128 amtOut;
-                if (params.amountSpecified < 0) {
-                    uint256 absSpec = uint256(-params.amountSpecified);
-                    uint256 out = (absSpec * aiPrice) / 1e18;
-                    amtOut = _safeInt128(int256(out));
-                } else {
-                    uint256 absSpec = uint256(params.amountSpecified);
-                    uint256 out = (absSpec * aiPrice) / 1e18;
-                    amtOut = -_safeInt128(int256(out));
-                }
-                BeforeSwapDelta delta = toBeforeSwapDelta(amtOut, hookDeltaSpecified);
-                return (BaseHook.beforeSwap.selector, delta, BASE_FEE);
-            }
+        return _modeBSwap(key, params, hookData, id);
+    }
+
+    function _modeBSwap(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata hookData,
+        PoolId id
+    ) internal returns (bytes4, BeforeSwapDelta, uint24) {
+        // Mode B: exact-input only. For exact output, fall back to Mode A (oracle price).
+        if (params.amountSpecified >= 0) {
+            return _modeASwap(key, params);
         }
 
-        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE);
+        // hookData format: abi.encode(bytes proof)
+        // Fallback to Mode A if data missing or attestation invalid
+        if (hookData.length < 64) {
+            return _modeASwap(key, params);
+        }
+
+        bytes calldata proof = _extractModeBProof(hookData);
+
+        // Verify TEE attestation from Chronicle
+        (bool valid, uint256 aiPrice) = chronicle.verifyAttestation(proof);
+        if (!valid || aiPrice == 0) {
+            return _modeASwap(key, params);
+        }
+
+        // Use AgentPricing library to compute swap at AI-inferred price
+        AgentPricing.SwapResult memory result = AgentPricing.computeSwap(
+            params, key, aiPrice, poolManager
+        );
+
+        // Track yield + emit Mode B event
+        cumulativeYield[id] += result.feeAmount;
+        emit ModeBSwap(id, aiPrice, result.grossOutput, result.feeAmount);
+
+        return (BaseHook.beforeSwap.selector, result.delta, 0);
     }
 
     function _modeASwap(
@@ -476,15 +495,19 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         return int128(x);
     }
 
-    function _extractModeBData(bytes calldata hookData)
+    function _extractModeBProof(bytes calldata hookData)
         internal
         pure
-        returns (bytes calldata proof, int128 hookDeltaSpecified)
+        returns (bytes calldata proof)
     {
-        uint256 proofLen;
-        assembly { proofLen := calldataload(hookData.offset) }
-        proof = hookData[32:32 + proofLen];
-        hookDeltaSpecified = abi.decode(hookData[32 + proofLen:], (int128));
+        // abi.encode(bytes memory) format: [offset (32 bytes)][length (32 bytes)][data (padded)]
+        uint256 dataOffset;
+        assembly { dataOffset := calldataload(hookData.offset) }
+        // dataOffset is typically 32 for single-element encode
+        uint256 dataLen;
+        assembly { dataLen := calldataload(add(hookData.offset, dataOffset)) }
+        uint256 dataStart = dataOffset + 32;
+        proof = hookData[dataStart : dataStart + dataLen];
     }
 
     receive() external payable {}
