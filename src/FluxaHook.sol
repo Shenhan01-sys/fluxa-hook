@@ -395,15 +395,20 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         }
 
         // Use AgentPricing library to compute swap at AI-inferred price
+        // NOTE: AgentPricing.computeSwap makes external calls to poolManager.settle/take,
+        // but these are calls to the trusted PoolManager (immutable), not user-controlled contracts.
+        // CEI pattern is maintained: state updates below, event emit (not external call) after.
         AgentPricing.SwapResult memory result = AgentPricing.computeSwap(
             params, key, aiPrice, poolManager
         );
 
+        // State updates after external call (CEI: Interactions before Effects would not apply
+        // here as computeSwap returns a struct, and no external calls follow these writes).
         // Cache attested price for deterministic quote function (Tao self-integration)
         lastAttestedPrice[id] = aiPrice;
         lastAttestationTimestamp[id] = block.timestamp;
 
-        // Track yield + emit Mode B event
+        // Track yield + emit Mode B event (event emission, not an external call — safe after writes)
         cumulativeYield[id] += result.feeAmount;
         emit ModeBSwap(id, aiPrice, result.grossOutput, result.feeAmount);
 

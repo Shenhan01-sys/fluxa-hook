@@ -8,6 +8,7 @@ contract FluxaLPShares is ERC20 {
     error OnlyHook();
 
     constructor(address _hook) ERC20("Fluxa LP Shares", "FLUXA-LP") {
+        require(_hook != address(0), "Zero hook address");
         hook = _hook;
     }
 
