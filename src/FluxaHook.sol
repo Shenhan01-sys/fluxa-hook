@@ -51,6 +51,7 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
     mapping(PoolId => bool)          private _instrumentRegistered;
     mapping(PoolId => PoolState)     private _poolState;
     mapping(PoolId => address)       public  poolAgent;
+    mapping(PoolId => uint256)       public  poolAgentId;
     mapping(PoolId => Auction)       private _auctions;
     mapping(PoolId => mapping(address => mapping(bytes32 => bool))) public bids;
     mapping(PoolId => mapping(address => uint256))  public bidAmounts;
@@ -141,6 +142,12 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         emit InstrumentRegistered(poolId, instrument.token, instrument.riskTier, instrument.illiquid, instrument.maturityTs);
     }
 
+    function setPoolAgent(PoolId poolId, uint256 agentId) external onlyOwner {
+        if (!_instrumentRegistered[poolId]) revert InstrumentNotRegistered(poolId);
+        poolAgentId[poolId] = agentId;
+        poolAgent[poolId] = agentNft.ownerOf(agentId);
+    }
+
     function afterInitialize(address, PoolKey calldata key, uint160, int24)
         external
         view
@@ -194,6 +201,16 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         if (!_instrumentRegistered[poolId]) revert InstrumentNotRegistered(poolId);
         if (_poolState[poolId] != PoolState.Normal) {
             revert InvalidState(poolId, _poolState[poolId], PoolState.Normal);
+        }
+
+        // ERC-8004 reputation gate: if sender is the pool's registered agent, check reputation
+        uint256 agentId = poolAgentId[poolId];
+        if (agentId != 0 && sender == poolAgent[poolId]) {
+            IERC8004Registry.ReputationSummary memory rep =
+                reputationRegistry.getSummary(agentId, address(this), bytes32(0));
+            if (uint256(uint128(rep.score)) < REPUTATION_THRESHOLD) {
+                revert ReputationTooLow(sender, uint256(uint128(rep.score)));
+            }
         }
 
         uint256 totalLiq0 = totalLiquidity0[poolId];
