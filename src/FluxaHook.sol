@@ -10,6 +10,7 @@ import {AgentPricing} from "./libraries/AgentPricing.sol";
 
 import {IChronicleOracle} from "./interfaces/IChronicleOracle.sol";
 import {IERC8004Registry, IERC7857Agent} from "./interfaces/IERC8004Registry.sol";
+import {IEigenLayerAVS} from "./interfaces/IEigenLayerAVS.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -46,6 +47,14 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
     IChronicleOracle public immutable chronicle;
     IERC8004Registry public immutable reputationRegistry;
     IERC7857Agent    public immutable agentNft;
+
+    // ── Agent layer: AVS validation + x402 payment + reputation feedback ──
+    IEigenLayerAVS public avsValidator; // optional (address(0) = skip AVS check)
+    uint256 public constant X402_PAYMENT_BPS = 10; // 0.1% of swap fee → agent micropayment
+
+    mapping(PoolId => uint256) private _lastSwapFee; // fee from most recent swap (for afterSwap)
+    mapping(PoolId => uint256) public agentPaymentAccrued; // x402 accrued micropayments
+    mapping(PoolId => uint256) public agentPaymentFunds;   // USDC deposited to fund x402 claims
 
     mapping(PoolId => RWAInstrument) private _instruments;
     mapping(PoolId => bool)          private _instrumentRegistered;
@@ -146,6 +155,35 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         if (!_instrumentRegistered[poolId]) revert InstrumentNotRegistered(poolId);
         poolAgentId[poolId] = agentId;
         poolAgent[poolId] = agentNft.ownerOf(agentId);
+    }
+
+    /// @notice Set EigenLayer AVS validator (optional). address(0) disables AVS checks.
+    function setAVSValidator(address _avs) external onlyOwner {
+        avsValidator = IEigenLayerAVS(_avs);
+    }
+
+    /// @notice Owner deposits USDC to fund agent x402 micropayments for a pool
+    function depositAgentFunds(PoolId poolId, uint256 amount) external onlyOwner {
+        PoolKey storage key = _poolKeys[poolId];
+        IERC20(Currency.unwrap(key.currency1)).safeTransferFrom(msg.sender, address(this), amount);
+        agentPaymentFunds[poolId] += amount;
+    }
+
+    /// @notice Agent owner claims accrued x402 micropayments (paid from deposited funds)
+    function claimAgentPayment(PoolId poolId, uint256 amount) external nonReentrant {
+        uint256 agentId = poolAgentId[poolId];
+        require(agentId != 0, "no agent");
+        require(msg.sender == poolAgent[poolId], "not agent owner");
+        if (agentPaymentAccrued[poolId] < amount) revert InsufficientPayment(poolId, agentPaymentAccrued[poolId], amount);
+        if (agentPaymentFunds[poolId] < amount) revert InsufficientPayment(poolId, agentPaymentFunds[poolId], amount);
+
+        agentPaymentAccrued[poolId] -= amount;
+        agentPaymentFunds[poolId] -= amount;
+
+        PoolKey storage key = _poolKeys[poolId];
+        IERC20(Currency.unwrap(key.currency1)).safeTransfer(msg.sender, amount);
+
+        emit AgentPaymentClaimed(poolId, msg.sender, amount);
     }
 
     function afterInitialize(address, PoolKey calldata key, uint160, int24)
@@ -411,6 +449,17 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
             return _modeASwap(key, params);
         }
 
+        // EigenLayer AVS validation: re-execute agent decision (stub — skip if no validator set)
+        uint256 agentId = poolAgentId[id];
+        if (address(avsValidator) != address(0) && agentId != 0) {
+            bytes32 decisionHash = keccak256(abi.encodePacked(aiPrice));
+            (bool avsValid, string memory avsReason) = avsValidator.validateDecision(agentId, decisionHash, proof);
+            emit AVSValidation(id, agentId, avsValid, avsReason);
+            if (!avsValid) {
+                return _modeASwap(key, params);
+            }
+        }
+
         // Use AgentPricing library to compute swap at AI-inferred price
         // NOTE: AgentPricing.computeSwap makes external calls to poolManager.settle/take,
         // but these are calls to the trusted PoolManager (immutable), not user-controlled contracts.
@@ -427,6 +476,7 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
 
         // Track yield + emit Mode B event (event emission, not an external call — safe after writes)
         cumulativeYield[id] += result.feeAmount;
+        _lastSwapFee[id] = result.feeAmount;
         emit ModeBSwap(id, aiPrice, result.grossOutput, result.feeAmount);
 
         return (BaseHook.beforeSwap.selector, result.delta, 0);
@@ -471,6 +521,7 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
         }
 
         cumulativeYield[id] += fee;
+        _lastSwapFee[id] = fee;
 
         return (BaseHook.beforeSwap.selector, beforeSwapDelta, 0);
     }
@@ -492,6 +543,23 @@ contract FluxaHook is BaseHook, IFluxaHook, IUnlockCallback, Ownable, Reentrancy
             _safeInt128(int256(delta.amount1())),
             ""
         );
+
+        // ── Agent layer: reputation feedback + x402 micropayment accrual ──
+        uint256 agentId = poolAgentId[id];
+        uint256 fee = _lastSwapFee[id];
+        if (agentId != 0 && fee > 0) {
+            // ERC-8004: reputation evolves on-chain based on yield generated
+            // Non-blocking: if reputationRegistry reverts, swap still succeeds
+            try reputationRegistry.giveFeedback(agentId, int128(int256(fee)), bytes32("tradingYield")) {
+                emit ReputationFeedback(id, agentId, int128(int256(fee)), bytes32("tradingYield"));
+            } catch {}
+
+            // x402: accrue agent micropayment (0.1% of swap fee)
+            uint256 x402Amount = (fee * X402_PAYMENT_BPS) / 10000;
+            agentPaymentAccrued[id] += x402Amount;
+            emit AgentPaymentAccrued(id, agentId, x402Amount);
+        }
+        _lastSwapFee[id] = 0;
 
         return (BaseHook.afterSwap.selector, 0);
     }

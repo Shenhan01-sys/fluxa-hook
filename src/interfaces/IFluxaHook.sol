@@ -68,6 +68,12 @@ interface IFluxaHook {
     event AuctionSettled(PoolId indexed poolId, address winner, uint256 amount, uint256 fee, uint256 netToLPs);
     event ModeBSwap(PoolId indexed poolId, uint256 aiPrice, uint256 grossOutput, uint256 feeAmount);
 
+    // ── Agent layer events (ERC-8004 feedback + x402 payment + AVS validation) ──
+    event ReputationFeedback(PoolId indexed poolId, uint256 indexed agentId, int128 delta, bytes32 tag);
+    event AgentPaymentAccrued(PoolId indexed poolId, uint256 indexed agentId, uint256 amount);
+    event AgentPaymentClaimed(PoolId indexed poolId, address indexed agent, uint256 amount);
+    event AVSValidation(PoolId indexed poolId, uint256 indexed agentId, bool valid, string reason);
+
     error InvalidState(PoolId poolId, PoolState current, PoolState expected);
     error AuctionNotActive(PoolId poolId);
     error CommitDeadlinePassed(PoolId poolId);
@@ -80,6 +86,8 @@ interface IFluxaHook {
     error NotAgentOwner(address caller, uint256 agentId);
     error InstrumentNotRegistered(PoolId poolId);
     error OnlyOwner();
+    error AVSRejected(string reason);
+    error InsufficientPayment(PoolId poolId, uint256 accrued, uint256 requested);
 
     function registerInstrument(PoolId poolId, RWAInstrument calldata instrument, PoolKey calldata key) external;
     function setDistress(PoolId poolId, PoolState newState) external;
@@ -88,6 +96,11 @@ interface IFluxaHook {
     function commitBid(PoolId poolId, bytes32 commitHash) external;
     function revealBid(PoolId poolId, uint256 amount, bytes32 nonce) external;
     function settleAuction(PoolId poolId) external;
+
+    function setPoolAgent(PoolId poolId, uint256 agentId) external;
+    function setAVSValidator(address avs) external;
+    function claimAgentPayment(PoolId poolId, uint256 amount) external;
+    function depositAgentFunds(PoolId poolId, uint256 amount) external;
 
     // Tao self-integration: deterministic quote + metadata views
     function quote(PoolId poolId, uint256 inputAmount, bool zeroForOne) external view returns (uint256 outputAmount, uint256 feeAmount);
