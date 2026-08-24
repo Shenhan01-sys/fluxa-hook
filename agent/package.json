@@ -1,0 +1,23 @@
+{
+  "name": "fluxa-agent-service",
+  "version": "1.0.0",
+  "description": "Off-chain AI agent that computes fair price for illiquid RWA, generates TEE attestation mock, and registers it on-chain with FluxaHook",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "serve": "tsx src/index.ts --serve",
+    "price": "tsx src/index.ts --price-only",
+    "register": "tsx src/index.ts --register",
+    "build-hookdata": "tsx src/index.ts --hookdata"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "@types/node": "^22.5.0"
+  }
+}

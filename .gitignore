@@ -2,3 +2,9 @@ out/
 cache/
 broadcast/
 .env
+
+agent/node_modules/
+agent/dist/
+agent/server.log
+agent/server.err
+*.log
